@@ -1,0 +1,51 @@
+{
+  "name": "web3-guild-bot",
+  "version": "2.1.0",
+  "description": "Telegram бот для модерации и геймификации Web3 сообществ (Оптимизированная версия)",
+  "main": "complete-bot-js-fixed.js",
+  "scripts": {
+    "start": "node complete-bot-js-fixed.js",
+    "admin": "node admin-panel-fixed.js",
+    "dev": "nodemon complete-bot-js-fixed.js",
+    "dev:admin": "nodemon admin-panel-fixed.js",
+    "dev:both": "concurrently \"npm run dev\" \"npm run dev:admin\"",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "eslint *.js",
+    "clean": "node -e \"console.log('Очистка временных файлов...')\"",
+    "db:check": "node -e \"const mongoose = require('mongoose'); mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/web3_guild_bot').then(() => {console.log('✅ База данных доступна'); process.exit(0);}).catch(err => {console.error('❌ Ошибка подключения к БД:', err.message); process.exit(1);});\""
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "moderation",
+    "web3",
+    "crypto",
+    "gamification",
+    "optimized",
+    "performance"
+  ],
+  "author": "Web3 Guild Team",
+  "license": "MIT",
+  "dependencies": {
+    "telegraf": "^4.15.6",
+    "mongoose": "^8.0.3",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2",
+    "concurrently": "^8.2.2",
+    "eslint": "^8.55.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/web3guild/telegram-bot"
+  },
+  "bugs": {
+    "url": "https://github.com/web3guild/telegram-bot/issues"
+  },
+  "homepage": "https://github.com/web3guild/telegram-bot#readme"
+}
