@@ -58,37 +58,9 @@ const logSchema = new mongoose.Schema({
   details: { type: mongoose.Schema.Types.Mixed, default: {} }
 });
 
-// Схема для сохранения отложенных сообщений
-const pendingMessageSchema = new mongoose.Schema({
-  user_id: { type: Number, required: true, index: true },
-  username: { type: String, default: '' },
-  first_name: { type: String, default: '' },
-  message_text: { type: String, required: true },
-  message_type: { type: String, default: 'text' },
-  chat_id: { type: Number, required: true },
-  created_at: { type: Date, default: Date.now },
-  expires_at: { 
-    type: Date, 
-    default: () => new Date(Date.now() + config.moderation.pendingMessageHours * 60 * 60 * 1000),
-    index: true
-  }
-});
-
 const User = mongoose.model('User', userSchema);
 const Log = mongoose.model('Log', logSchema);
-const PendingMessage = mongoose.model('PendingMessage', pendingMessageSchema);
 
-// Очистка истёкших отложенных сообщений каждый час
-setInterval(async () => {
-  try {
-    const deleted = await PendingMessage.deleteMany({ expires_at: { $lt: new Date() } }).maxTimeMS(5000);
-    if (deleted.deletedCount > 0) {
-      console.log(`🗑️ Удалено ${deleted.deletedCount} истёкших черновиков`);
-    }
-  } catch (error) {
-    console.error('Ошибка очистки истёкших сообщений:', error);
-  }
-}, 60 * 60 * 1000);
 
 // ==================== MIDDLEWARE ====================
 // Убираем session - может вызывать блокировки
@@ -112,6 +84,8 @@ bot.use(async (ctx, next) => {
 // ==================== ОБРАБОТКА НОВЫХ УЧАСТНИКОВ ====================
 bot.on(message('new_chat_members'), async (ctx) => {
   const newMembers = ctx.message.new_chat_members;
+
+  await ensureBotPermissions(ctx);
   
   // Обрабатываем асинхронно, не блокируя
   for (const member of newMembers) {
@@ -145,7 +119,9 @@ bot.on(message('new_chat_members'), async (ctx) => {
 bot.on(message('text'), async (ctx) => {
   // Игнорируем сообщения в личке и от ботов
   if (ctx.chat.type === 'private' || ctx.from.is_bot) return;
-  
+
+  await ensureBotPermissions(ctx);
+
   const userId = ctx.from.id;
   const text = ctx.message.text;
   const messageId = ctx.message.message_id;
@@ -157,17 +133,26 @@ bot.on(message('text'), async (ctx) => {
       User.findOne({ user_id: userId }),
       new Promise((_, reject) => setTimeout(() => reject(new Error('DB timeout')), 3000))
     ]);
-    
+
     if (!userData) {
+      let memberInfo;
+      try {
+        memberInfo = await ctx.getChatMember(userId);
+      } catch (_) {
+        memberInfo = null;
+      }
+
+      const alreadyInChat = memberInfo && memberInfo.status !== 'left' && memberInfo.status !== 'kicked';
+
       userData = new User({
         user_id: userId,
         username: ctx.from.username || null,
         first_name: ctx.from.first_name || '',
         join_date: new Date(),
-        last_activity: new Date()
+        last_activity: new Date(),
+        captcha_verified: alreadyInChat
       });
-      
-      // Сохраняем асинхронно
+
       setImmediate(async () => {
         try {
           await userData.save();
@@ -177,14 +162,21 @@ bot.on(message('text'), async (ctx) => {
       });
     }
 
+    if (userData.is_muted && userData.mute_until && userData.mute_until < new Date()) {
+      userData.is_muted = false;
+      userData.mute_until = null;
+      setImmediate(async () => {
+        try {
+          await userData.save();
+        } catch (error) {
+          console.error('Ошибка обновления статуса мута:', error);
+        }
+      });
+    }
+
     // Проверка на верификацию капчи
     if (!userData.captcha_verified) {
       await ctx.deleteMessage(messageId).catch(() => {}); // Игнорируем ошибки удаления
-      
-      // Сохраняем сообщение как черновик асинхронно
-      setImmediate(() => savePendingMessage(userId, ctx.from.username || '', ctx.from.first_name || '', text, ctx.chat.id));
-      
-      // Показываем капчу
       await showCaptcha(ctx, ctx.from);
       return;
     }
@@ -254,8 +246,7 @@ async function showCaptcha(ctx, user) {
 
     const captchaText = `🔐 @${user.username || user.first_name}, добро пожаловать!\n\n` +
       `Для начала общения решите пример:\n` +
-      `**${num1} + ${num2} = ?**\n\n` +
-      `Ваше сообщение сохранено и будет опубликовано после проверки.`;
+      `**${num1} + ${num2} = ?**`;
 
     const keyboard = Markup.inlineKeyboard([
       [
@@ -340,9 +331,6 @@ bot.action(/captcha_(\d+)_(\d+)/, async (ctx) => {
       // Удаляем сообщение с капчей
       await ctx.deleteMessage().catch(() => {});
 
-      // Публикуем сохранённое сообщение асинхронно
-      setImmediate(() => publishPendingMessage(ctx, userId));
-
       // Приветствие
       const welcomeMsg = await ctx.reply(
         `🎉 @${ctx.from.username || ctx.from.first_name} успешно прошёл проверку и теперь может участвовать в обсуждениях!`
@@ -368,54 +356,6 @@ bot.action(/captcha_(\d+)_(\d+)/, async (ctx) => {
     await ctx.answerCbQuery('❌ Произошла ошибка').catch(() => {});
   }
 });
-
-// ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С ОТЛОЖЕННЫМИ СООБЩЕНИЯМИ ====================
-async function savePendingMessage(userId, username, firstName, messageText, chatId) {
-  try {
-    // Удаляем предыдущие отложенные сообщения этого пользователя
-    await PendingMessage.deleteMany({ user_id: userId }).maxTimeMS(2000);
-    
-    // Сохраняем новое сообщение
-    const pendingMessage = new PendingMessage({
-      user_id: userId,
-      username: username,
-      first_name: firstName,
-      message_text: messageText,
-      chat_id: chatId
-    });
-    
-    await pendingMessage.save();
-    console.log(`💾 Сообщение сохранено как черновик: ${firstName} (ID: ${userId})`);
-  } catch (error) {
-    console.error('Ошибка сохранения отложенного сообщения:', error);
-  }
-}
-
-async function publishPendingMessage(ctx, userId) {
-  try {
-    const pendingMessage = await PendingMessage.findOne({ user_id: userId }).maxTimeMS(2000);
-    
-    if (pendingMessage) {
-      // Публикуем сохранённое сообщение
-      await ctx.reply(
-        `📝 Сообщение от @${pendingMessage.username || pendingMessage.first_name}:\n\n${pendingMessage.message_text}`
-      ).catch(() => {});
-      
-      // Удаляем из черновиков асинхронно
-      setImmediate(async () => {
-        try {
-          await PendingMessage.deleteOne({ user_id: userId });
-        } catch (error) {
-          console.error('Ошибка удаления черновика:', error);
-        }
-      });
-      
-      console.log(`📤 Опубликовано отложенное сообщение: ${pendingMessage.first_name} (ID: ${userId})`);
-    }
-  } catch (error) {
-    console.error('Ошибка публикации отложенного сообщения:', error);
-  }
-}
 
 // ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
@@ -539,6 +479,44 @@ function calculateLevel(points) {
 // Кеш для админов (избегаем частых запросов к API)
 const adminCache = new Map();
 const ADMIN_CACHE_TTL = 5 * 60 * 1000; // 5 минут
+const ADMIN_CACHE_MAX_SIZE = 1000;
+
+function setCacheWithLimit(map, key, value, limit) {
+  if (map.size >= limit) {
+    const oldestKey = map.keys().next().value;
+    map.delete(oldestKey);
+  }
+  map.set(key, value);
+}
+
+const permissionCache = new Map();
+const PERMISSION_CACHE_TTL = 60 * 60 * 1000; // 1 час
+const PERMISSION_CACHE_MAX_SIZE = 100;
+
+async function ensureBotPermissions(ctx) {
+  const chatId = ctx.chat.id;
+  const cached = permissionCache.get(chatId);
+
+  if (cached && Date.now() - cached.timestamp < PERMISSION_CACHE_TTL) {
+    return cached.perms;
+  }
+
+  try {
+    const me = await bot.telegram.getMe();
+    const member = await ctx.getChatMember(me.id);
+
+    setCacheWithLimit(permissionCache, chatId, { perms: member, timestamp: Date.now() }, PERMISSION_CACHE_MAX_SIZE);
+
+    if (!member.can_delete_messages || !member.can_restrict_members) {
+      console.warn(`⚠️ Недостаточно прав бота в чате ${chatId}: delete=${member.can_delete_messages}, restrict=${member.can_restrict_members}`);
+    }
+
+    return member;
+  } catch (error) {
+    console.error('Ошибка проверки прав бота:', error);
+    return null;
+  }
+}
 
 // Функция проверки администратора с кешированием
 async function isAdmin(ctx, userId) {
@@ -554,10 +532,10 @@ async function isAdmin(ctx, userId) {
     const isAdminResult = ['creator', 'administrator'].includes(member.status);
     
     // Кешируем результат
-    adminCache.set(cacheKey, {
+    setCacheWithLimit(adminCache, cacheKey, {
       isAdmin: isAdminResult,
       timestamp: Date.now()
-    });
+    }, ADMIN_CACHE_MAX_SIZE);
     
     return isAdminResult;
   } catch (error) {
